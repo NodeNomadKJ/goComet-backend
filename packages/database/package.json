@@ -1,0 +1,24 @@
+{
+  "name": "@gocomet/database",
+  "version": "1.0.0",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "dependencies": {
+    "@nestjs/common": "^11.0.0",
+    "@nestjs/config": "^4.0.0",
+    "@nestjs/typeorm": "^11.0.0",
+    "typeorm": "^0.3.20",
+    "pg": "^8.13.0",
+    "uuid": "^11.0.0",
+    "@gocomet/common": "workspace:*"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "@types/uuid": "^10.0.0",
+    "@types/pg": "^8.11.0"
+  }
+}
