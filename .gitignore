@@ -1,5 +1,10 @@
 node_modules/
 dist/
+# compiled artifacts accidentally emitted into src/
+packages/**/src/**/*.js
+packages/**/src/**/*.js.map
+packages/**/src/**/*.d.ts
+packages/**/src/**/*.d.ts.map
 .env
 .env.local
 coverage/
