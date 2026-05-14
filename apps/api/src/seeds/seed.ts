@@ -20,7 +20,25 @@ async function seed(): Promise<void> {
   try {
     await client.query('BEGIN');
 
-    const passwordHash = await bcrypt.hash('Test@1234', 12);
+    // Clean slate — truncate all seed tables in dependency order
+    await client.query(`
+      TRUNCATE TABLE
+        trip_events,
+        payments,
+        trips,
+        rides,
+        rider_payment_methods,
+        vehicles,
+        drivers,
+        riders,
+        users,
+        regions,
+        tenants
+      CASCADE
+    `);
+
+    const bcryptRounds = parseInt(process.env.BCRYPT_ROUNDS ?? '10', 10);
+    const passwordHash = await bcrypt.hash('Test@1234', bcryptRounds);
     const now = new Date();
     const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
     const oneHourAgo = new Date(now.getTime() - 60 * 60 * 1000);
@@ -106,15 +124,15 @@ async function seed(): Promise<void> {
 
     // ─── Riders ────────────────────────────────────────────────────────────
     const riders = [
-      [rider1Id, rider1UserId, 'Rahul Sharma',  'rahul@example.com',  '+919876543210', 4.80, 12],
-      [rider2Id, rider2UserId, 'Priya Patel',   'priya@example.com',  '+919876543211', 4.95,  7],
-      [rider3Id, rider3UserId, 'Amit Kumar',    'amit@example.com',   '+919876543212', 4.50,  3],
+      [rider1Id, rider1UserId, 4.80, 12],
+      [rider2Id, rider2UserId, 4.95,  7],
+      [rider3Id, rider3UserId, 4.50,  3],
     ];
-    for (const [id, userId, name, email, phone, rating, totalRides] of riders) {
+    for (const [id, userId, rating, totalRides] of riders) {
       await client.query(`
-        INSERT INTO "riders" ("id","tenantId","regionId","userId","name","email","phone","rating","totalRides","preferences")
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'{"defaultVehicleType":"ECONOMY","defaultPaymentMethodId":null}')
-      `, [id, tenantId, regionId, userId, name, email, phone, rating, totalRides]);
+        INSERT INTO "riders" ("id","tenantId","regionId","userId","rating","totalRides","preferences")
+        VALUES ($1,$2,$3,$4,$5,$6,'{"defaultVehicleType":"ECONOMY","defaultPaymentMethodId":null}')
+      `, [id, tenantId, regionId, userId, rating, totalRides]);
     }
 
     // ─── Rider Payment Methods ─────────────────────────────────────────────
@@ -129,18 +147,18 @@ async function seed(): Promise<void> {
 
     // ─── Drivers ───────────────────────────────────────────────────────────
     const drivers = [
-      // [id, userId, name, email, phone, status, rating, totalTrips, activeVehicleId, lat, lng]
-      [driver1Id, driver1UserId, 'Suresh Yadav',   'suresh@example.com',  '+919876543213', 'AVAILABLE', 4.90, 156, vehicle1Id, 12.9352272, 77.6244793],
-      [driver2Id, driver2UserId, 'Ramesh Singh',   'ramesh@example.com',  '+919876543214', 'BUSY',      4.75,  98, vehicle2Id, 12.9716, 77.5946],
-      [driver3Id, driver3UserId, 'Vikram Chauhan', 'vikram@example.com',  '+919876543215', 'AVAILABLE', 4.85,  74, vehicle3Id, 12.9279, 77.6271],
-      [driver4Id, driver4UserId, 'Deepak Verma',   'deepak@example.com',  '+919876543216', 'OFFLINE',   4.60,  31, null,        null,       null],
-      [driver5Id, driver5UserId, 'Manoj Kumar',    'manoj@example.com',   '+919876543217', 'OFFLINE',   4.70,  45, null,        null,       null],
+      // [id, userId, status, rating, totalTrips, activeVehicleId, lat, lng]
+      [driver1Id, driver1UserId, 'AVAILABLE', 4.90, 156, vehicle1Id, 12.9352272, 77.6244793],
+      [driver2Id, driver2UserId, 'BUSY',      4.75,  98, vehicle2Id, 12.9716,    77.5946],
+      [driver3Id, driver3UserId, 'AVAILABLE', 4.85,  74, vehicle3Id, 12.9279,    77.6271],
+      [driver4Id, driver4UserId, 'OFFLINE',   4.60,  31, null,       null,       null],
+      [driver5Id, driver5UserId, 'OFFLINE',   4.70,  45, null,       null,       null],
     ];
-    for (const [id, userId, name, email, phone, status, rating, totalTrips, activeVehicleId, lat, lng] of drivers) {
+    for (const [id, userId, status, rating, totalTrips, activeVehicleId, lat, lng] of drivers) {
       await client.query(`
-        INSERT INTO "drivers" ("id","tenantId","regionId","userId","name","email","phone","status","rating","totalTrips","activeVehicleId","lastLocationLat","lastLocationLng","lastLocationUpdatedAt")
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-      `, [id, tenantId, regionId, userId, name, email, phone, status, rating, totalTrips,
+        INSERT INTO "drivers" ("id","tenantId","regionId","userId","status","rating","totalTrips","activeVehicleId","lastLocationLat","lastLocationLng","lastLocationUpdatedAt")
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+      `, [id, tenantId, regionId, userId, status, rating, totalTrips,
           activeVehicleId, lat, lng, lat ? now : null]);
     }
 
