@@ -1,7 +1,7 @@
 import { Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { Kafka, Consumer } from 'kafkajs';
+import { Consumer } from 'kafkajs';
 import { KAFKA_TOPICS } from '@gocomet/common';
+import { KafkaClientFactory } from '../kafka/kafka-client.factory';
 
 const DLQ_TOPICS = Object.values(KAFKA_TOPICS).map((t) => `${t}.dlq`);
 
@@ -10,16 +10,10 @@ export class DlqConsumer implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(DlqConsumer.name);
   private consumer!: Consumer;
 
-  constructor(private readonly config: ConfigService) {}
+  constructor(private readonly kafkaFactory: KafkaClientFactory) {}
 
   async onModuleInit(): Promise<void> {
-    const kafka = new Kafka({
-      clientId: 'gocomet-worker-dlq',
-      brokers: [this.config.get<string>('KAFKA_BROKERS', 'localhost:19092')],
-      retry: { initialRetryTime: 100, retries: 8, multiplier: 2 },
-    });
-
-    this.consumer = kafka.consumer({ groupId: 'worker-dlq-consumer' });
+    this.consumer = this.kafkaFactory.get().consumer({ groupId: 'worker-dlq-consumer' });
     await this.consumer.connect();
     await this.consumer.subscribe({ topics: DLQ_TOPICS, fromBeginning: false });
 

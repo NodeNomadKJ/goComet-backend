@@ -24,7 +24,8 @@
     "rxjs": "^7.8.0",
     "@gocomet/common": "workspace:*",
     "@gocomet/database": "workspace:*",
-    "@gocomet/redis": "workspace:*"
+    "@gocomet/redis": "workspace:*",
+    "@socket.io/redis-emitter": "^5.1.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.0",

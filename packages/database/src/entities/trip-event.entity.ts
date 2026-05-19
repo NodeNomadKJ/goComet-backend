@@ -1,5 +1,5 @@
 import { Column, Entity, Index } from 'typeorm';
-import { BaseEntity } from '@gocomet/database';
+import { BaseEntity } from '../base.entity';
 import { TripStatus } from '@gocomet/common';
 
 @Entity('trip_events')

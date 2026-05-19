@@ -13,6 +13,7 @@ import type Redis from 'ioredis';
 import { RideEntity } from './entities/ride.entity';
 import { KafkaProducerService } from '../kafka/kafka-producer.service';
 import { TripService } from '../trips/trip.service';
+import { RealtimeService } from '../realtime/realtime.service';
 import type { CreateRideDto } from './dto/create-ride.dto';
 import type { FareEstimateDto } from './dto/fare-estimate.dto';
 
@@ -77,6 +78,7 @@ export class RideService {
     @InjectRedis() private readonly redis: Redis,
     private readonly kafkaProducer: KafkaProducerService,
     private readonly tripService: TripService,
+    private readonly realtimeService: RealtimeService,
   ) {}
 
   async estimateFare(dto: FareEstimateDto, regionId: string): Promise<FareBreakdown> {
@@ -192,6 +194,23 @@ export class RideService {
     ride.status = RideStatus.CANCELLED;
     ride.cancellationReason = reason;
     const cancelled = await this.rideRepo.save(ride);
+
+    // If matching was in progress, find any pending offer and clean it up.
+    // This: (1) makes the gateway reject any late accept, (2) unblocks the
+    // worker's waitForResponse immediately instead of waiting the full 10s timeout,
+    // (3) dismisses the offer banner on the driver's UI.
+    // Unblock the worker's waitForResponse immediately — one publish covers all candidates
+    // since the lifecycle channel is per-ride, not per-driver
+    await this.redis.publish(`ride:lifecycle:${rideId}`, 'cancelled');
+
+    // Find any driver currently holding an offer UI — dismiss their banner
+    const offerKeys = await this.redis.keys(`ride:offer:${rideId}:*`);
+    for (const key of offerKeys) {
+      const driverId = key.split(':').pop()!;
+      await this.redis.del(key);
+      this.realtimeService.emitToDriver(driverId, 'offer:cancelled', { rideId });
+    }
+
     await this.kafkaProducer.emit(
       KAFKA_TOPICS.RIDE_REQUEST_CANCELLED,
       { rideId, riderId, reason },

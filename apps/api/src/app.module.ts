@@ -10,7 +10,6 @@ import { DriverModule } from './modules/drivers/driver.module';
 import { RideModule } from './modules/rides/ride.module';
 import { RealtimeModule } from './modules/realtime/realtime.module';
 import { KafkaModule } from './modules/kafka/kafka.module';
-import { MatchingModule } from './modules/matching/matching.module';
 import { TripModule } from './modules/trips/trip.module';
 import { PaymentModule } from './modules/payments/payment.module';
 import { TenantModule } from './modules/tenants/tenant.module';
@@ -47,7 +46,6 @@ import { TenantMiddleware } from './modules/tenants/tenant.middleware';
     DriverModule,
     RideModule,
     RealtimeModule,
-    MatchingModule,
     TripModule,
     PaymentModule,
     TenantModule,

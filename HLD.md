@@ -56,9 +56,12 @@ completely isolated at the data layer.
                                                                 │
                                               ┌─────────────────▼──────────────┐
                                               │      apps/worker  (NestJS)     │
+                                              │  MatchingConsumer              │
                                               │  PaymentConsumer               │
                                               │  NotificationConsumer          │
                                               │  LocationSnapshotConsumer      │
+                                              │  TripCompletedConsumer         │
+                                              │  DlqConsumer                   │
                                               └────────────────────────────────┘
 ```
 
@@ -66,8 +69,8 @@ completely isolated at the data layer.
 
 | Component | Responsibility |
 |---|---|
-| `apps/api` | All HTTP endpoints + Socket.IO gateway + Matching consumer (needs WS access) |
-| `apps/worker` | Heavy async consumers — payment processing, notifications, DB snapshots |
+| `apps/api` | All HTTP endpoints + Socket.IO gateway + KafkaProducerService (produces only, never consumes) |
+| `apps/worker` | All async Kafka consumers — matching, payment processing, notifications, DB snapshots, DLQ |
 | `packages/database` | TypeORM entities, migrations, shared DB module |
 | `packages/redis` | ioredis provider, injected across both apps |
 | `packages/common` | DTOs, enums, Kafka topic constants, event interfaces |
@@ -268,24 +271,37 @@ Driver HTTP POST /drivers/location
 Rider creates ride  ──► RideService.createRide()
                     ──► Kafka emit: ride.request.created
 
-MatchingConsumer (in API app, co-located with Socket.IO):
-  1. GEORADIUS drivers:geo:{regionId} {lat} {lng} 5km
-  2. Filter: only driverIds where driver:status:{id}.status = AVAILABLE
-  3. Rank: sort by (rating DESC, distance ASC)
-  4. Acquire distributed lock: SET matching:lock:{rideId} NX EX 30
-  5. For each candidate:
+MatchingConsumer (in apps/worker):
+  1. Acquire distributed lock: SET matching:lock:{rideId} NX EX 30
+  2. UPDATE rides SET status = MATCHING
+  3. GEOSEARCH drivers:geo:{regionId} FROMLONLAT {lng} {lat} BYRADIUS {radius} km ASC COUNT 10
+  4. Filter: only driverIds where driver:status:{id}.status = AVAILABLE and vehicleType matches
+             and driverId NOT IN ride:declined:{rideId} (Redis SET)
+  5. Rank: sort by (rating DESC, distance ASC) — take top 5
+  6. For each candidate:
        SET ride:offer:{rideId}:{driverId}  NX EX 10
-       Emit Socket.IO offer → driver room
-       Subscribe to Redis pub/sub: offer.response.{rideId}.{driverId}
+       @socket.io/redis-emitter → /driver room driver:{driverId} → "ride:offer"
+         (worker has no Socket.IO server; redis-emitter writes to Redis;
+          apps/api Socket.IO server picks it up via Redis adapter and delivers to driver)
+       Redis SUBSCRIBE offer:response.{rideId}.{driverId}
        Await 10s (offer TTL):
-         Accept → update ride status, create TripEntity, unlock
-         Decline / timeout → try next candidate
-  6. Radius fallback: 5km → 10km → 15km (3 rounds)
-  7. No driver found → emit ride.matching.failed → notify rider
+         Accept → DB transaction: UPDATE rides + INSERT TripEntity (atomic)
+                  Redis: HSET driver:status BUSY, SET driver:active-ride
+                  Kafka: driver.assignment.created
+                  redis-emitter → rider room: ride:status DRIVER_ASSIGNED
+                  redis-emitter → driver room: trip:assigned
+         Decline / timeout → SADD ride:declined:{rideId} {driverId}, try next candidate
+  7. Radius fallback: 5km → 10km → 15km (3 rounds)
+  8. No driver found → UPDATE rides SET status = FAILED
+                       Kafka: ride.matching.failed
+                       redis-emitter → rider: ride:status FAILED
+  9. Finally: DEL matching:lock:{rideId}, DEL ride:declined:{rideId}
 ```
 
-**Matching consumer lives in the API app** (not the worker) because it needs direct Socket.IO
-access to push offers to drivers. The worker cannot emit WebSocket events.
+**Matching consumer lives in apps/worker** (not the API). The worker uses
+`@socket.io/redis-emitter` to push events into Redis; `apps/api`'s Socket.IO server
+(via the Redis adapter) delivers them to connected clients. This keeps the API process
+stateless — it only produces Kafka events and never runs long-lived consumers.
 
 ### 5.3 Surge Pricing
 
@@ -470,22 +486,22 @@ CREATE UNIQUE INDEX rides_idempotency ON rides (tenant_id, idempotency_key);
 
 ## 7. Kafka Event Architecture
 
-### Topics (12 total)
+### Topics (11 active)
 
 ```
-Producer                    Topic                          Consumer(s)
-──────────────────────────────────────────────────────────────────────────
-RideService            →   ride.request.created       →   MatchingConsumer (API)
-MatchingConsumer       →   ride.matching.failed        →   NotificationConsumer
-MatchingConsumer       →   driver.assignment.created   →   TripService, NotificationConsumer
-LocationService        →   driver.location.updated     →   LocationSnapshotConsumer (Worker)
-TripService            →   trip.status.changed         →   NotificationConsumer
-TripService            →   trip.completed              →   PaymentConsumer
-PaymentService         →   payment.charge.requested    →   PSPConsumer (Worker)
-PSPConsumer            →   payment.charge.completed    →   TripService, NotificationConsumer
-PSPConsumer            →   payment.charge.failed       →   TripService, NotificationConsumer
-Multiple               →   notification.push.requested →   FCMConsumer
-Multiple               →   notification.sms.requested  →   SMSConsumer
+Producer (process)              Topic                           Consumer(s) (process)
+───────────────────────────────────────────────────────────────────────────────────────────
+RideService (api)          →   ride.request.created        →   MatchingConsumer (worker)
+RideService (api)          →   ride.request.cancelled      →   NotificationConsumer (worker)
+MatchingService (worker)   →   ride.matching.failed        →   NotificationConsumer (worker)
+MatchingService (worker)   →   driver.assignment.created   →   NotificationConsumer (worker)
+LocationService (api)      →   driver.location.updated     →   LocationSnapshotConsumer (worker)
+TripService (api)          →   trip.status.changed         →   NotificationConsumer (worker)
+TripService (api)          →   trip.completed              →   TripCompletedConsumer (worker)
+TripService (api)          →   payment.charge.requested    →   PaymentConsumer (worker)
+PaymentConsumer (worker)   →   payment.charge.completed    →   PaymentService webhook (api)
+PaymentConsumer (worker)   →   payment.charge.failed       →   PaymentService webhook (api)
+Multiple                   →   notification.push.requested →   NotificationConsumer (worker)
 ```
 
 ### Event Envelope (all events)

@@ -1,13 +1,14 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository, EntityManager, DataSource } from 'typeorm';
-import { TripStatus, PaymentStatus, RideStatus, KAFKA_TOPICS } from '@gocomet/common';
-import { TripEntity } from './entities/trip.entity';
-import { TripEventEntity } from './entities/trip-event.entity';
+import { TripStatus, PaymentStatus, RideStatus, KAFKA_TOPICS, DriverStatus } from '@gocomet/common';
+import { TripEntity, TripEventEntity } from '@gocomet/database';
 import { RideEntity } from '../rides/entities/ride.entity';
 import { PaymentEntity } from '../payments/entities/payment.entity';
 import { RealtimeService } from '../realtime/realtime.service';
 import { KafkaProducerService } from '../kafka/kafka-producer.service';
+import { InjectRedis } from '@gocomet/redis';
+import type Redis from 'ioredis';
 import {
   TripNotFoundException,
   InvalidTripTransitionException,
@@ -38,6 +39,7 @@ export class TripService {
     private readonly dataSource: DataSource,
     private readonly realtimeService: RealtimeService,
     private readonly kafkaProducer: KafkaProducerService,
+    @InjectRedis() private readonly redis: Redis,
   ) {}
 
   async createTrip(
@@ -340,7 +342,13 @@ export class TripService {
       ),
     ]);
 
+    await Promise.all([
+      this.redis.hset(`driver:status:${trip.driverId}`, 'status', DriverStatus.AVAILABLE),
+      this.redis.del(`driver:active-ride:${trip.driverId}`),
+    ]);
+
     this.realtimeService.emitRideStatus(trip.rideId, { rideId: trip.rideId, status: RideStatus.CANCELLED });
+    this.realtimeService.emitToDriver(trip.driverId, 'trip:cancelled', { tripId, rideId: trip.rideId });
 
     return updated;
   }

@@ -1,10 +1,10 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { Kafka, Producer } from 'kafkajs';
+import { Producer } from 'kafkajs';
 import { v4 as uuidv4 } from 'uuid';
 import { KAFKA_TOPICS } from '@gocomet/common';
 import type { DomainEvent } from '@gocomet/common';
 import { KafkaConsumerBase } from '../kafka/kafka-consumer.base';
+import { KafkaClientFactory } from '../kafka/kafka-client.factory';
 import { ProcessedEventsService } from '../kafka/processed-events.service';
 
 interface PaymentChargePayload {
@@ -24,16 +24,12 @@ export class PaymentConsumer extends KafkaConsumerBase implements OnModuleInit, 
 
   private producer!: Producer;
 
-  constructor(config: ConfigService, processedEvents: ProcessedEventsService) {
-    super(config, processedEvents);
+  constructor(kafkaFactory: KafkaClientFactory, processedEvents: ProcessedEventsService) {
+    super(kafkaFactory, processedEvents);
   }
 
   async onModuleInit(): Promise<void> {
-    const kafka = new Kafka({
-      clientId: 'gocomet-worker-payment',
-      brokers: [this.config.get<string>('KAFKA_BROKERS', 'localhost:19092')],
-    });
-    this.producer = kafka.producer({ allowAutoTopicCreation: true });
+    this.producer = this.kafkaFactory.get().producer({ allowAutoTopicCreation: true });
     await this.producer.connect();
     await super.onModuleInit();
   }

@@ -1,14 +1,13 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { DriverStatus, RideStatus, VehicleType, KAFKA_TOPICS } from '@gocomet/common';
+import { InjectDataSource } from '@nestjs/typeorm';
+import { DataSource } from 'typeorm';
+import { DriverStatus, RideStatus, VehicleType, KAFKA_TOPICS, TripStatus, PaymentStatus } from '@gocomet/common';
 import { InjectRedis } from '@gocomet/redis';
 import type Redis from 'ioredis';
-import { RideEntity } from '../rides/entities/ride.entity';
-import { RealtimeService } from '../realtime/realtime.service';
-import { TripService } from '../trips/trip.service';
-import { KafkaProducerService } from '../kafka/kafka-producer.service';
-import type { RideOfferPayload } from '../realtime/events/realtime-event.types';
+import { Emitter } from '@socket.io/redis-emitter';
+import { TripEntity } from '@gocomet/database';
+import { KafkaProducerService } from '../../kafka/kafka-producer.service';
+import type { RideOfferPayload } from './interfaces/realtime-event.types';
 
 interface DriverCandidate {
   driverId: string;
@@ -20,14 +19,15 @@ interface DriverCandidate {
 @Injectable()
 export class MatchingService {
   private readonly logger = new Logger(MatchingService.name);
+  private readonly emitter: Emitter;
 
   constructor(
     @InjectRedis() private readonly redis: Redis,
-    @InjectRepository(RideEntity) private readonly rideRepo: Repository<RideEntity>,
-    private readonly realtimeService: RealtimeService,
-    private readonly tripService: TripService,
+    @InjectDataSource() private readonly dataSource: DataSource,
     private readonly kafkaProducer: KafkaProducerService,
-  ) {}
+  ) {
+    this.emitter = new Emitter(redis);
+  }
 
   async startMatching(
     rideId: string,
@@ -49,17 +49,20 @@ export class MatchingService {
     }
 
     try {
-      await this.rideRepo.update({ id: rideId, tenantId }, { status: RideStatus.MATCHING });
+      await this.dataSource.query(
+        `UPDATE rides SET status = $1 WHERE id = $2 AND "tenantId" = $3`,
+        [RideStatus.MATCHING, rideId, tenantId],
+      );
 
       let assigned = false;
       const declinedKey = `ride:declined:${rideId}`;
 
       for (const radius of [5, 10, 15]) {
-        // Exclude drivers already offered this ride (declined or timed out on earlier pass)
         const alreadyOffered = new Set(await this.redis.smembers(declinedKey));
         const candidates = (await this.findCandidates(regionId, pickupLng, pickupLat, radius, vehicleType))
           .filter(c => !alreadyOffered.has(c.driverId));
 
+        let rideCancelled = false;
         for (const candidate of candidates) {
           const result = await this.offerRide(
             rideId, tenantId, regionId, riderId, candidate,
@@ -67,23 +70,24 @@ export class MatchingService {
             pickupAddress, dropAddress, correlationId,
           );
 
-          if (result === 'accepted') {
-            assigned = true;
-            break;
-          }
+          if (result === 'accepted') { assigned = true; break; }
+          if (result === 'cancelled') { rideCancelled = true; break; }
 
-          // Track offered-but-not-accepted drivers so wider radius passes skip them
           await this.redis.sadd(declinedKey, candidate.driverId);
           await this.redis.expire(declinedKey, 1800);
         }
 
-        if (assigned) break;
+        if (assigned || rideCancelled) break;
       }
 
       if (!assigned) {
-        await this.rideRepo.update({ id: rideId, tenantId }, { status: RideStatus.FAILED });
+        const { rowCount } = await this.dataSource.query(
+          `UPDATE rides SET status = $1 WHERE id = $2 AND "tenantId" = $3 AND status = $4`,
+          [RideStatus.FAILED, rideId, tenantId, RideStatus.MATCHING],
+        );
+        if (rowCount === 0) return; // rider cancelled during matching — ride already CANCELLED
         await this.kafkaProducer.emit(KAFKA_TOPICS.RIDE_MATCHING_FAILED, { rideId, riderId }, tenantId, regionId, correlationId);
-        this.realtimeService.emitToRider(riderId, 'ride:status', { rideId, status: RideStatus.FAILED });
+        this.emitter.of('/rider').to(`user:${riderId}`).emit('ride:status', { rideId, status: RideStatus.FAILED });
       }
     } finally {
       await this.redis.del(`matching:lock:${rideId}`);
@@ -145,7 +149,7 @@ export class MatchingService {
     pickupAddress: string,
     dropAddress: string,
     correlationId: string,
-  ): Promise<'accepted' | 'declined' | 'timeout'> {
+  ): Promise<'accepted' | 'declined' | 'timeout' | 'cancelled'> {
     await this.redis.set(
       `ride:offer:${rideId}:${candidate.driverId}`,
       JSON.stringify({ offeredAt: Date.now(), riderId }),
@@ -164,15 +168,41 @@ export class MatchingService {
       expiresAt: Date.now() + 10000,
     };
 
-    this.realtimeService.emitRideOffer(candidate.driverId, offerPayload);
+    this.emitter.of('/driver').to(`driver:${candidate.driverId}`).emit('ride:offer', offerPayload);
 
-    const result = await this.waitForResponse(`offer:response:${rideId}:${candidate.driverId}`, 10000);
+    const result = await this.waitForResponse(
+      `offer:response:${rideId}:${candidate.driverId}`,
+      `ride:lifecycle:${rideId}`,
+      10000,
+    );
 
     if (result === 'accepted') {
-      await this.rideRepo.update(
-        { id: rideId, tenantId },
-        { driverId: candidate.driverId, status: RideStatus.DRIVER_ASSIGNED },
-      );
+      // One DB transaction: ride status + trip insert — no consistency window
+      const trip = await this.dataSource.transaction(async (em) => {
+        await em.query(
+          `UPDATE rides SET status = $1, "driverId" = $2 WHERE id = $3 AND "tenantId" = $4`,
+          [RideStatus.DRIVER_ASSIGNED, candidate.driverId, rideId, tenantId],
+        );
+        const entity = em.create(TripEntity, {
+          rideId,
+          driverId: candidate.driverId,
+          riderId,
+          tenantId,
+          regionId,
+          status: TripStatus.DRIVER_ASSIGNED,
+          startedAt: null,
+          completedAt: null,
+          durationSecs: null,
+          distanceKm: null,
+          finalFare: null,
+          cancellationReason: null,
+          cancellationFee: null,
+          paymentStatus: PaymentStatus.PENDING,
+        });
+        return em.save(TripEntity, entity);
+      });
+
+      // Redis state — tight sequence before any other matching sees this driver
       await this.redis.hset(`driver:status:${candidate.driverId}`, 'status', DriverStatus.BUSY);
       await this.redis.set(`driver:active-ride:${candidate.driverId}`, rideId, 'EX', 14400);
       await this.redis.hset(`ride:active:${rideId}`, {
@@ -180,22 +210,16 @@ export class MatchingService {
         driverId: candidate.driverId,
         riderId,
       });
-      const trip = await this.tripService.createTrip(rideId, candidate.driverId, riderId, tenantId, regionId);
+
       await this.kafkaProducer.emit(
         KAFKA_TOPICS.DRIVER_ASSIGNMENT_CREATED,
-        { rideId, driverId: candidate.driverId, riderId },
-        tenantId,
-        regionId,
-        correlationId,
+        { rideId, driverId: candidate.driverId, riderId, tripId: trip.id },
+        tenantId, regionId, correlationId,
       );
-      this.realtimeService.emitToRider(riderId, 'ride:status', {
-        rideId,
-        status: RideStatus.DRIVER_ASSIGNED,
-        driverId: candidate.driverId,
+      this.emitter.of('/rider').to(`user:${riderId}`).emit('ride:status', {
+        rideId, status: RideStatus.DRIVER_ASSIGNED, driverId: candidate.driverId,
       });
-      // Push trip data directly to the driver — avoids race where frontend
-      // queries DB before the trip row is committed.
-      this.realtimeService.emitToDriver(candidate.driverId, 'trip:assigned', trip);
+      this.emitter.of('/driver').to(`driver:${candidate.driverId}`).emit('trip:assigned', trip);
     }
 
     await this.redis.del(`ride:offer:${rideId}:${candidate.driverId}`);
@@ -203,12 +227,12 @@ export class MatchingService {
     return result;
   }
 
-  private waitForResponse(channel: string, timeoutMs: number): Promise<'accepted' | 'declined' | 'timeout'> {
+  private waitForResponse(responseChannel: string, lifecycleChannel: string, timeoutMs: number): Promise<'accepted' | 'declined' | 'timeout' | 'cancelled'> {
     return new Promise((resolve) => {
       const subscriber = this.redis.duplicate();
       let settled = false;
 
-      const cleanup = (result: 'accepted' | 'declined' | 'timeout') => {
+      const cleanup = (result: 'accepted' | 'declined' | 'timeout' | 'cancelled') => {
         if (settled) return;
         settled = true;
         subscriber.unsubscribe().finally(() => subscriber.disconnect());
@@ -217,15 +241,19 @@ export class MatchingService {
 
       const timer = setTimeout(() => cleanup('timeout'), timeoutMs);
 
-      subscriber.subscribe(channel, (err) => {
+      subscriber.subscribe(responseChannel, lifecycleChannel, (err) => {
         if (err) {
           clearTimeout(timer);
           cleanup('timeout');
         }
       });
 
-      subscriber.on('message', (_ch: string, message: string) => {
+      subscriber.on('message', (ch: string, message: string) => {
         clearTimeout(timer);
+        if (ch === lifecycleChannel && message === 'cancelled') {
+          cleanup('cancelled');
+          return;
+        }
         cleanup(message === 'accepted' ? 'accepted' : 'declined');
       });
     });

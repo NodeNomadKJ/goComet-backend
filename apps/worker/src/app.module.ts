@@ -4,10 +4,13 @@ import { TypeOrmModule } from '@nestjs/typeorm';
 import { ScheduleModule } from '@nestjs/schedule';
 import { RedisModule } from '@gocomet/redis';
 import { KafkaModule } from './kafka/kafka.module';
+import { MatchingModule } from './modules/matching/matching.module';
 import { LocationSnapshotConsumer } from './consumers/location-snapshot.consumer';
+import { MatchingConsumer } from './consumers/matching.consumer';
 import { PaymentConsumer } from './consumers/payment.consumer';
 import { NotificationConsumer } from './consumers/notification.consumer';
 import { DlqConsumer } from './consumers/dlq.consumer';
+import { TripCompletedConsumer } from './consumers/trip-completed.consumer';
 
 @Module({
   imports: [
@@ -32,7 +35,8 @@ import { DlqConsumer } from './consumers/dlq.consumer';
     ScheduleModule.forRoot(),
     RedisModule,
     KafkaModule,
+    MatchingModule,
   ],
-  providers: [LocationSnapshotConsumer, PaymentConsumer, NotificationConsumer, DlqConsumer],
+  providers: [LocationSnapshotConsumer, MatchingConsumer, PaymentConsumer, NotificationConsumer, DlqConsumer, TripCompletedConsumer],
 })
 export class AppModule {}

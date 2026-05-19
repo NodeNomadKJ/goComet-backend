@@ -1,12 +1,12 @@
 import { Injectable, Logger, OnModuleInit, OnModuleDestroy } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
-import { Kafka, Consumer } from 'kafkajs';
+import { Consumer } from 'kafkajs';
 import { KAFKA_TOPICS } from '@gocomet/common';
 import type { DomainEvent } from '@gocomet/common';
 import { InjectRedis } from '@gocomet/redis';
 import type Redis from 'ioredis';
+import { KafkaClientFactory } from '../kafka/kafka-client.factory';
 
 interface LocationUpdatedPayload {
   driverId: string;
@@ -27,19 +27,13 @@ export class LocationSnapshotConsumer implements OnModuleInit, OnModuleDestroy {
   private consumer!: Consumer;
 
   constructor(
-    private readonly config: ConfigService,
+    private readonly kafkaFactory: KafkaClientFactory,
     @InjectDataSource() private readonly dataSource: DataSource,
     @InjectRedis() private readonly redis: Redis,
   ) {}
 
   async onModuleInit(): Promise<void> {
-    const kafka = new Kafka({
-      clientId: 'gocomet-worker-location-snapshot',
-      brokers: [this.config.get<string>('KAFKA_BROKERS', 'localhost:19092')],
-      retry: { initialRetryTime: 100, retries: 8, multiplier: 2 },
-    });
-
-    this.consumer = kafka.consumer({ groupId: 'worker-driver.location.updated-batch-consumer' });
+    this.consumer = this.kafkaFactory.get().consumer({ groupId: 'worker-driver.location.updated-batch-consumer' });
     await this.consumer.connect();
     await this.consumer.subscribe({ topic: KAFKA_TOPICS.DRIVER_LOCATION_UPDATED, fromBeginning: false });
 

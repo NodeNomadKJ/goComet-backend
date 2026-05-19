@@ -1,8 +1,8 @@
 import { OnModuleInit, OnModuleDestroy, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { Kafka, Consumer, Producer, EachMessagePayload, CompressionTypes } from 'kafkajs';
+import { Consumer, Producer, EachMessagePayload, CompressionTypes } from 'kafkajs';
 import type { DomainEvent } from '@gocomet/common';
 import { ProcessedEventsService } from './processed-events.service';
+import { KafkaClientFactory } from './kafka-client.factory';
 
 const MAX_RETRIES = 3;
 
@@ -15,16 +15,12 @@ export abstract class KafkaConsumerBase implements OnModuleInit, OnModuleDestroy
   private dlqProducer!: Producer;
 
   constructor(
-    protected readonly config: ConfigService,
+    protected readonly kafkaFactory: KafkaClientFactory,
     protected readonly processedEvents: ProcessedEventsService,
   ) {}
 
   async onModuleInit(): Promise<void> {
-    const kafka = new Kafka({
-      clientId: `gocomet-worker-${this.groupId}`,
-      brokers: [this.config.get<string>('KAFKA_BROKERS', 'localhost:19092')],
-      retry: { initialRetryTime: 100, retries: 8, multiplier: 2 },
-    });
+    const kafka = this.kafkaFactory.get();
 
     this.dlqProducer = kafka.producer();
     await this.dlqProducer.connect();

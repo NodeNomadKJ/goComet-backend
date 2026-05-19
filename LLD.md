@@ -563,93 +563,123 @@ Response 202:
 
 ## 4. Matching Engine — Algorithm Detail
 
+Lives in `apps/worker/src/modules/matching/matching.service.ts`.
+The worker has no Socket.IO server — it uses `@socket.io/redis-emitter` to write events
+into Redis; `apps/api`'s Socket.IO server (via Redis adapter) delivers them to clients.
+
 ```typescript
-async function matchRide(event: RideRequestCreatedEvent): Promise<void> {
-  const { rideId, regionId, tenantId, vehicleType, pickupLat, pickupLng } = event.payload;
+// apps/worker — MatchingService (simplified)
+import { Emitter } from '@socket.io/redis-emitter';
+const emitter = new Emitter(redis);   // initialised once in constructor
 
-  // Distributed lock prevents two consumers matching the same ride
-  const lockKey = `matching:lock:${rideId}`;
-  const locked = await redis.set(lockKey, '1', 'NX', 'EX', 30);
-  if (!locked) return;  // another consumer already handling this ride
+async function startMatching(rideId, tenantId, regionId, riderId, pickupLng, pickupLat,
+                              vehicleType, fareEstimate, pickupAddress, dropAddress): Promise<void> {
+  // Distributed lock — prevents two worker pods matching the same ride
+  const lock = await redis.set(`matching:lock:${rideId}`, '1', 'EX', 30, 'NX');
+  if (lock === null) return;   // another pod is already handling this ride
 
-  const RADII = [5, 10, 15];  // km — expand on each round
+  const declinedKey = `ride:declined:${rideId}`;
 
-  for (const radiusKm of RADII) {
-    // Step 1: Geospatial query (Redis only — no PostgreSQL)
-    const nearby = await redis.georadius(
-      `drivers:geo:${regionId}`,
-      pickupLng,
-      pickupLat,
-      radiusKm,
-      'km',
-      'WITHCOORD',
-      'WITHDIST',
-      'ASC',          // closest first
-      'COUNT', 20,    // max candidates per round
-    );
+  try {
+    await dataSource.query(`UPDATE rides SET status = $1 WHERE id = $2`, [RideStatus.MATCHING, rideId]);
 
-    // Step 2: Filter by status and vehicle type
-    const candidates = [];
-    for (const [driverId, dist, [lng, lat]] of nearby) {
-      const status = await redis.hgetall(`driver:status:${driverId}`);
-      if (status.status !== DriverStatus.AVAILABLE) continue;
-      if (vehicleType !== VehicleType.ANY && status.vehicleType !== vehicleType) continue;
-      candidates.push({ driverId, distKm: parseFloat(dist), rating: parseFloat(status.rating ?? '5') });
-    }
+    let assigned = false;
 
-    if (candidates.length === 0) continue;  // try wider radius
-
-    // Step 3: Rank candidates
-    candidates.sort((a, b) => {
-      // Primary: rating descending; secondary: distance ascending
-      const ratingDiff = b.rating - a.rating;
-      return ratingDiff !== 0 ? ratingDiff : a.distKm - b.distKm;
-    });
-
-    // Step 4: Offer flow — try candidates in order
-    for (const candidate of candidates) {
-      const offered = await redis.set(
-        `ride:offer:${rideId}:${candidate.driverId}`,
-        JSON.stringify({ offeredAt: Date.now() }),
-        'NX', 'EX', 10,   // 10s offer window
+    for (const radius of [5, 10, 15]) {
+      // Step 1: Geospatial query (Redis only — no PostgreSQL)
+      const nearby = await redis.call(
+        'GEOSEARCH', `drivers:geo:${regionId}`,
+        'FROMLONLAT', pickupLng, pickupLat,
+        'BYRADIUS', radius, 'km', 'ASC', 'COUNT', 10, 'WITHDIST',
       );
-      if (!offered) continue;  // already offered to this driver
 
-      // Emit offer via Socket.IO
-      await realtimeService.emitToDriver(candidate.driverId, 'ride:offer', {
-        rideId, pickupAddress, fareEstimate, riderId,
-      });
+      // Step 2: Filter — AVAILABLE, right vehicle type, not already declined
+      const declined = await redis.smembers(declinedKey);
+      const declinedSet = new Set(declined);
 
-      // Wait for response via Redis pub/sub
-      const response = await waitForOfferResponse(rideId, candidate.driverId, 10_000);
-
-      if (response?.accepted) {
-        await assignDriver(rideId, candidate.driverId, tenantId, regionId);
-        await redis.del(lockKey);
-        return;  // done
+      const candidates: DriverCandidate[] = [];
+      for (const [driverId, dist] of nearby) {
+        if (declinedSet.has(driverId)) continue;
+        const status = await redis.hgetall(`driver:status:${driverId}`);
+        if (status.status !== DriverStatus.AVAILABLE) continue;
+        if (vehicleType !== VehicleType.ANY && status.vehicleType !== vehicleType) continue;
+        candidates.push({ driverId, distance: parseFloat(dist), rating: parseFloat(status.rating ?? '5'), vehicleType: status.vehicleType });
       }
-      // declined or timed out → try next candidate
-    }
-  }
 
-  // No driver found after all radii
-  await kafkaProducer.emit(KAFKA_TOPICS.RIDE_MATCHING_FAILED, { rideId, tenantId, regionId });
-  await updateRideStatus(rideId, RideStatus.FAILED);
-  await redis.del(lockKey);
+      if (candidates.length === 0) continue;   // expand radius
+
+      // Step 3: Rank — rating DESC, then distance ASC; take top 5
+      candidates.sort((a, b) => b.rating - a.rating || a.distance - b.distance);
+      const top = candidates.slice(0, 5);
+
+      for (const candidate of top) {
+        const accepted = await offerRide(rideId, tenantId, regionId, riderId,
+                                         candidate.driverId, fareEstimate, pickupAddress, dropAddress);
+        if (accepted) { assigned = true; break; }
+      }
+      if (assigned) break;
+    }
+
+    if (!assigned) {
+      await dataSource.query(`UPDATE rides SET status = $1 WHERE id = $2`, [RideStatus.FAILED, rideId]);
+      await kafkaProducer.emit(KAFKA_TOPICS.RIDE_MATCHING_FAILED, { rideId, tenantId, regionId });
+      // Notify rider via redis-emitter (worker has no Socket.IO server)
+      emitter.of('/rider').to(`user:${riderId}`).emit('ride:status', { rideId, status: RideStatus.FAILED });
+    }
+  } finally {
+    await redis.del(`matching:lock:${rideId}`);
+    await redis.del(declinedKey);
+  }
 }
 
-async function assignDriver(rideId, driverId, tenantId, regionId): Promise<void> {
-  // All in one DB transaction
-  await dataSource.transaction(async (em) => {
-    await em.update(RideEntity, { id: rideId }, { status: RideStatus.DRIVER_ASSIGNED, driverId });
-    await em.update(DriverEntity, { id: driverId }, { status: DriverStatus.BUSY });
-    const trip = em.create(TripEntity, { rideId, driverId, riderId, tenantId, regionId, status: TripStatus.DRIVER_ASSIGNED });
-    await em.save(trip);
+async function offerRide(rideId, tenantId, regionId, riderId, driverId,
+                          fareEstimate, pickupAddress, dropAddress): Promise<boolean> {
+  await redis.set(`ride:offer:${rideId}:${driverId}`,
+    JSON.stringify({ offeredAt: Date.now(), riderId }), 'EX', 10, 'NX');
+
+  // Emit offer via redis-emitter — no direct Socket.IO dependency in worker
+  emitter.of('/driver').to(`driver:${driverId}`).emit('ride:offer', {
+    rideId, riderId, fareEstimate, pickupAddress, dropAddress,
+    expiresAt: Date.now() + 10_000,
   });
 
-  // Post-commit side effects
-  await redis.set(`driver:active-ride:${driverId}`, rideId, 'EX', 14400);
-  await kafkaProducer.emit(KAFKA_TOPICS.DRIVER_ASSIGNMENT_CREATED, { rideId, driverId, tripId });
+  // Wait up to 10s for DriverGateway (API) to publish the response
+  const response = await waitForOfferResponse(rideId, driverId, 10_000);
+
+  if (!response?.accepted) {
+    await redis.sadd(declinedKey, driverId);   // exclude from future rounds
+    await redis.del(`ride:offer:${rideId}:${driverId}`);
+    return false;
+  }
+
+  // Atomic: update ride + create trip in one DB transaction
+  const trip = await dataSource.transaction(async (em) => {
+    await em.query(`UPDATE rides SET status=$1, "driverId"=$2 WHERE id=$3`,
+      [RideStatus.DRIVER_ASSIGNED, driverId, rideId]);
+    const entity = em.create(TripEntity, {
+      rideId, driverId, riderId, tenantId, regionId,
+      status: TripStatus.DRIVER_ASSIGNED, paymentStatus: PaymentStatus.PENDING,
+    });
+    return em.save(entity);
+  });
+
+  // Redis state updates (after DB commit)
+  await Promise.all([
+    redis.hset(`driver:status:${driverId}`, 'status', DriverStatus.BUSY),
+    redis.set(`driver:active-ride:${driverId}`, rideId, 'EX', 14400),
+    redis.hset(`ride:active:${rideId}`, 'status', RideStatus.DRIVER_ASSIGNED,
+               'driverId', driverId, 'riderId', riderId),
+  ]);
+
+  await kafkaProducer.emit(KAFKA_TOPICS.DRIVER_ASSIGNMENT_CREATED,
+    { rideId, driverId, riderId, tripId: trip.id });
+
+  // Notify rider and driver via redis-emitter
+  emitter.of('/rider').to(`user:${riderId}`)
+    .emit('ride:status', { rideId, status: RideStatus.DRIVER_ASSIGNED, driverId });
+  emitter.of('/driver').to(`driver:${driverId}`).emit('trip:assigned', trip);
+
+  return true;
 }
 ```
 
@@ -807,25 +837,27 @@ async function cacheIdempotencyResult(redisKey: string, responseBody: object) {
 
 ## 9. Kafka Consumer — Base Class Pattern
 
+All consumers in `apps/worker` extend `KafkaConsumerBase`. A shared `KafkaClientFactory`
+creates a single Kafka client reused across all consumers in the worker process.
+
 ```typescript
 abstract class KafkaConsumerBase {
   abstract topic: string;
   abstract groupId: string;
-  abstract process(event: DomainEvent<unknown>): Promise<void>;
+  abstract handle(event: DomainEvent<unknown>): Promise<void>;
 
   async onMessage(message: KafkaMessage): Promise<void> {
     const event: DomainEvent = JSON.parse(message.value!.toString());
 
     // Deduplication — skip already-processed events
-    const dedupKey = `processed:event:${event.eventId}`;
-    const alreadyProcessed = await redis.set(dedupKey, '1', 'NX', 'EX', 86400);
-    if (!alreadyProcessed) {
+    const alreadyProcessed = await processedEvents.isProcessed(event.eventId);
+    if (alreadyProcessed) {
       this.logger.log({ eventId: event.eventId }, 'Duplicate event skipped');
       return;
     }
 
     try {
-      await this.process(event);
+      await this.handle(event);
     } catch (err) {
       this.logger.error({ eventId: event.eventId, err }, 'Consumer processing failed');
       // After 3 retries (configured in KafkaJS), message goes to DLQ
@@ -834,6 +866,17 @@ abstract class KafkaConsumerBase {
   }
 }
 ```
+
+### Worker Consumers Summary
+
+| Consumer | Topic | Responsibility |
+|---|---|---|
+| `MatchingConsumer` | `ride.request.created` | Delegates to `MatchingService` — GEOSEARCH, offer flow |
+| `PaymentConsumer` | `payment.charge.requested` | Calls mock PSP, emits charge result |
+| `NotificationConsumer` | `notification.push.requested` | Sends push/SMS/email |
+| `LocationSnapshotConsumer` | `driver.location.updated` | Batch-writes lat/lng to PostgreSQL |
+| `TripCompletedConsumer` | `trip.completed` | Resets driver Redis status to AVAILABLE, DELs `driver:active-ride` |
+| `DlqConsumer` | DLQ topic | Logs and alerts on failed messages |
 
 ---
 
@@ -1016,7 +1059,7 @@ SURGE_RECALC_INTERVAL_SECS=30
 ```
 gocomet-ride-hailing/
 ├── apps/
-│   ├── api/                         ← Main NestJS app (REST + Socket.IO)
+│   ├── api/                         ← Main NestJS app (REST + Socket.IO — produces Kafka, never consumes)
 │   │   └── src/
 │   │       ├── main.ts              ← Fastify + New Relic bootstrap
 │   │       ├── app.module.ts
@@ -1027,7 +1070,6 @@ gocomet-ride-hailing/
 │   │           ├── drivers/         ← Driver CRUD, availability, vehicles
 │   │           ├── rides/           ← Ride create, fare estimate, cancel
 │   │           ├── trips/           ← State machine, transitions
-│   │           ├── matching/        ← GEOSEARCH + offer flow consumer
 │   │           ├── payments/        ← PaymentEntity, webhook handler
 │   │           ├── realtime/        ← Socket.IO gateways, RealtimeService
 │   │           ├── surge/           ← SurgePricingCron
@@ -1035,14 +1077,27 @@ gocomet-ride-hailing/
 │   │           ├── kafka/           ← KafkaProducerService
 │   │           └── users/           ← UserEntity
 │   │
-│   └── worker/                      ← Kafka consumer workers
+│   └── worker/                      ← All Kafka consumers (pure async process)
 │       └── src/
 │           ├── consumers/
+│           │   ├── matching.consumer.ts        ← ride.request.created
 │           │   ├── location-snapshot.consumer.ts
 │           │   ├── payment.consumer.ts
-│           │   └── notification.consumer.ts
-│           └── kafka/
-│               └── kafka-consumer.base.ts
+│           │   ├── notification.consumer.ts
+│           │   ├── trip-completed.consumer.ts  ← resets driver to AVAILABLE
+│           │   └── dlq.consumer.ts             ← dead-letter queue handler
+│           ├── kafka/
+│           │   ├── kafka-consumer.base.ts
+│           │   ├── kafka-producer.service.ts
+│           │   ├── kafka-client.factory.ts
+│           │   ├── kafka.module.ts
+│           │   └── processed-events.service.ts ← consumer deduplication
+│           └── modules/
+│               └── matching/
+│                   ├── matching.module.ts
+│                   ├── matching.service.ts      ← GEOSEARCH + offer flow + redis-emitter
+│                   └── interfaces/
+│                       └── realtime-event.types.ts
 │
 ├── packages/
 │   ├── common/                      ← Shared enums, DTOs, Kafka topic constants

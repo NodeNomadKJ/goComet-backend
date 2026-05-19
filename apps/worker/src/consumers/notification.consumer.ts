@@ -1,9 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { Kafka } from 'kafkajs';
 import { KAFKA_TOPICS } from '@gocomet/common';
 import type { DomainEvent } from '@gocomet/common';
 import { KafkaConsumerBase } from '../kafka/kafka-consumer.base';
+import { KafkaClientFactory } from '../kafka/kafka-client.factory';
 import { ProcessedEventsService } from '../kafka/processed-events.service';
 
 interface NotificationPayload {
@@ -20,17 +19,12 @@ export class NotificationConsumer extends KafkaConsumerBase {
   protected readonly topic = KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED;
   protected readonly groupId = 'worker-notification-consumer';
 
-  constructor(config: ConfigService, processedEvents: ProcessedEventsService) {
-    super(config, processedEvents);
+  constructor(kafkaFactory: KafkaClientFactory, processedEvents: ProcessedEventsService) {
+    super(kafkaFactory, processedEvents);
   }
 
   async onModuleInit(): Promise<void> {
-    const kafka = new Kafka({
-      clientId: `gocomet-worker-${this.groupId}`,
-      brokers: [this.config.get<string>('KAFKA_BROKERS', 'localhost:19092')],
-      retry: { initialRetryTime: 100, retries: 8, multiplier: 2 },
-    });
-    this.consumer = kafka.consumer({ groupId: this.groupId });
+    this.consumer = this.kafkaFactory.get().consumer({ groupId: this.groupId });
     await this.consumer.connect();
     await this.consumer.subscribe({
       topics: [
