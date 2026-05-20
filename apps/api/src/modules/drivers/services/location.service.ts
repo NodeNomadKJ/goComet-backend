@@ -69,6 +69,7 @@ export class LocationService {
       { driverId, userId, lat: dto.lat, lng: dto.lng, heading: dto.heading, regionId, tenantId, timestamp: Date.now() },
       tenantId,
       regionId,
+      driverId,
     );
 
     // WebSocket emit (driver:location → active ride room) wired in Phase 3

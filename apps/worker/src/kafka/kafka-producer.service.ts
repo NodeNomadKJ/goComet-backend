@@ -26,6 +26,7 @@ export class KafkaProducerService implements OnModuleInit, OnModuleDestroy {
     payload: T,
     tenantId: string,
     regionId: string,
+    partitionKey?: string,
     correlationId = uuidv4(),
   ): Promise<void> {
     const event: DomainEvent<T> = {
@@ -42,7 +43,7 @@ export class KafkaProducerService implements OnModuleInit, OnModuleDestroy {
     await this.producer.send({
       topic,
       compression: CompressionTypes.GZIP,
-      messages: [{ key: tenantId, value: JSON.stringify(event) }],
+      messages: [{ key: partitionKey ?? tenantId, value: JSON.stringify(event) }],
     });
 
     this.logger.debug({ topic, eventId: event.eventId, tenantId, regionId }, 'Kafka event emitted');

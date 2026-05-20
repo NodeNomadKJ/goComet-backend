@@ -38,7 +38,7 @@ export class AuthService {
     private readonly config: ConfigService,
     @InjectRedis() private readonly redis: Redis,
   ) {
-    this.BCRYPT_ROUNDS = config.get<number>('BCRYPT_ROUNDS', 10);
+    this.BCRYPT_ROUNDS = Number.parseInt(config.get('BCRYPT_ROUNDS', '10'), 10);
   }
 
   async registerRider(

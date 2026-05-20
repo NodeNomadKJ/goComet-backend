@@ -89,6 +89,7 @@ export class TripService {
         { tripId: trip.id, rideId, fromStatus: null, toStatus: TripStatus.DRIVER_ASSIGNED, driverId, riderId },
         tenantId,
         trip.regionId,
+        rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,
@@ -123,6 +124,7 @@ export class TripService {
         { tripId, rideId: trip.rideId, fromStatus: TripStatus.DRIVER_ASSIGNED, toStatus: TripStatus.DRIVER_ARRIVING },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,
@@ -159,6 +161,7 @@ export class TripService {
         { tripId, rideId: trip.rideId, fromStatus: TripStatus.DRIVER_ARRIVING, toStatus: TripStatus.DRIVER_ARRIVED },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,
@@ -196,6 +199,7 @@ export class TripService {
         { tripId, rideId: trip.rideId, fromStatus: TripStatus.DRIVER_ARRIVED, toStatus: TripStatus.RIDE_STARTED },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,
@@ -262,12 +266,14 @@ export class TripService {
         { tripId, rideId: trip.rideId, riderId: trip.riderId, driverId, finalFare, distanceKm: resolvedDistanceKm, durationSecs },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.PAYMENT_CHARGE_REQUESTED,
         { tripId, riderId: trip.riderId, amount: finalFare, currency: 'INR', tenantId, regionId: trip.regionId },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,
@@ -328,6 +334,7 @@ export class TripService {
         { tripId, rideId: trip.rideId, fromStatus: trip.status, toStatus: TripStatus.CANCELLED, actorId: resolvedActorId, actorRole, reason, cancellationFee },
         tenantId,
         trip.regionId,
+        trip.rideId,
       ),
       this.kafkaProducer.emit(
         KAFKA_TOPICS.NOTIFICATION_PUSH_REQUESTED,

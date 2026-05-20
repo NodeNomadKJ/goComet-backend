@@ -86,7 +86,7 @@ export class MatchingService {
           [RideStatus.FAILED, rideId, tenantId, RideStatus.MATCHING],
         );
         if (rowCount === 0) return; // rider cancelled during matching — ride already CANCELLED
-        await this.kafkaProducer.emit(KAFKA_TOPICS.RIDE_MATCHING_FAILED, { rideId, riderId }, tenantId, regionId, correlationId);
+        await this.kafkaProducer.emit(KAFKA_TOPICS.RIDE_MATCHING_FAILED, { rideId, riderId }, tenantId, regionId, rideId, correlationId);
         this.emitter.of('/rider').to(`user:${riderId}`).emit('ride:status', { rideId, status: RideStatus.FAILED });
       }
     } finally {
@@ -214,7 +214,7 @@ export class MatchingService {
       await this.kafkaProducer.emit(
         KAFKA_TOPICS.DRIVER_ASSIGNMENT_CREATED,
         { rideId, driverId: candidate.driverId, riderId, tripId: trip.id },
-        tenantId, regionId, correlationId,
+        tenantId, regionId, rideId, correlationId,
       );
       this.emitter.of('/rider').to(`user:${riderId}`).emit('ride:status', {
         rideId, status: RideStatus.DRIVER_ASSIGNED, driverId: candidate.driverId,

@@ -44,6 +44,7 @@ export class PaymentService {
         { paymentId: payment.id, tripId: payment.tripId, pspReference: body.pspReference },
         payment.tenantId,
         payment.regionId,
+        payment.tripId,
       );
     } else {
       payment.status = PaymentStatus.FAILED;
@@ -55,6 +56,7 @@ export class PaymentService {
         { paymentId: payment.id, tripId: payment.tripId, failureReason: payment.failureReason },
         payment.tenantId,
         payment.regionId,
+        payment.tripId,
       );
     }
   }

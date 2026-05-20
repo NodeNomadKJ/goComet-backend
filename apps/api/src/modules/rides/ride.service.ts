@@ -159,6 +159,7 @@ export class RideService {
       },
       tenantId,
       regionId,
+      saved.id,
     );
     return saved;
   }
@@ -216,6 +217,7 @@ export class RideService {
       { rideId, riderId, reason },
       tenantId,
       ride.regionId,
+      rideId,
     );
     return cancelled;
   }
